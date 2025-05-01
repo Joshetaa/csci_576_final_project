@@ -352,7 +352,7 @@ class GrowableCanvas:
 # ---------------------------------------------------------------------------
 # Stitch orchestration
 # ---------------------------------------------------------------------------
-def stitch(videos: List[str], stride: int, out_path: str):
+def stitch(videos: List[str], stride: int, estimator_arg: str, out_path: str):
     frames = []
     for v in videos:
         frames.extend(sample_frames(v, stride))
@@ -374,8 +374,12 @@ def stitch(videos: List[str], stride: int, out_path: str):
     cv2.imwrite(str(debug_dir / "debug_canvas_after_frame_000.png"), canvas.get_final_image())
 
     for i in range(1, len(frames)):
-        # M = estimator.estimate(frames[i-1], frames[i])
-        M = estimator.feature_detection_and_matching(frames[i-1], frames[i], i-1, i, videos[0])
+        if estimator_arg == "feature_detection_and_matching":
+            M = estimator.feature_detection_and_matching(frames[i-1], frames[i], i-1, i, videos[0])
+        elif estimator_arg == "naive":
+            M = estimator.estimate(frames[i-1], frames[i])
+        else:
+            raise ValueError(f"Unknown estimator: {estimator_arg}")
         dx, dy = M[0,2], M[1,2]
         combined_vis = estimator.create_debug_visualization(frames[i-1], frames[i], dx, dy)
         cv2.imwrite(str(debug_dir / f"debug_match_{i:03d}.png"), combined_vis)
@@ -397,9 +401,10 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='Panorama stitcher – sliver-based')
     ap.add_argument('--videos', nargs='+', required=True)
     ap.add_argument('--stride', type=int, default=1)
+    ap.add_argument('--estimator', type=str, default='feature_detection_and_matching')
     ap.add_argument('--out',    required=True)
     args = ap.parse_args()
     for p in args.videos:
         if not Path(p).exists():
             ap.error(f"Video not found: {p}")
-    stitch(args.videos, args.stride, args.out)
+    stitch(args.videos, args.stride, args.estimator, args.out)
