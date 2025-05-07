@@ -321,11 +321,17 @@ class GrowableCanvas:
             try:
                 # Use warpPerspective instead of warpAffine
                 warped_frame = cv2.warpPerspective(frame, H_final, (final_w, final_h),
-                                                 flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+                                                 flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
 
-                # Simple Overwrite Blending (remains the same logic for now)
-                mask = np.sum(warped_frame, axis=2) > 0
-                canvas[mask] = warped_frame[mask]
+                # Update canvas only where it's currently black (empty)
+                # and the warped_frame has non-black content.
+                # This prevents overwriting already filled parts of the canvas
+                # and helps avoid issues where black borders of a new frame
+                # would effectively erase existing content or leave black lines.
+                canvas_is_empty_mask = (np.sum(canvas, axis=2) == 0)
+                warped_frame_has_content_mask = (np.sum(warped_frame, axis=2) > 0)
+                update_mask = canvas_is_empty_mask & warped_frame_has_content_mask
+                canvas[update_mask] = warped_frame[update_mask]
 
             except cv2.error as e:
                 print(f"Error warping frame {i} with warpPerspective: {e}")
@@ -388,7 +394,7 @@ def stitch(videos: List[str], stride: int, estimator_arg: str, out_path: str):
         print(f"Adding frame {i} to canvas.")
         canvas.add(cur_frame, H_cum) # Add with the new H_cum
 
-        if i % 20 == 0:
+        if i % 100 == 0:
             print(f"Frame {i}: |H_cum| = {np.linalg.det(H_cum):.4f}, bottom row = {H_cum[2]}") 
             cv2.imwrite(str(debug_dir / f"debug_canvas_after_frame_{i:03d}.png"), canvas.get_final_image())
 
