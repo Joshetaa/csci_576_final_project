@@ -54,110 +54,6 @@ class MotionEstimator:
         self.min_match_count = min_match_count
         # No parameters needed for phase correlation itself
 
-    def naive_estimate(self, prev: np.ndarray, cur: np.ndarray) -> np.ndarray:
-        h, w = prev.shape[:2]
-        prev_gray_orb = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY) # uint8 for ORB
-        cur_gray_orb = cv2.cvtColor(cur, cv2.COLOR_BGR2GRAY)
-
-        # --- Attempt 1: Feature Matching (ORB + RANSAC) ---
-        kp1, des1 = self.orb.detectAndCompute(prev_gray_orb, None)
-        kp2, des2 = self.orb.detectAndCompute(cur_gray_orb, None)
-
-        M = None
-        inlier_count = 0
-        if des1 is not None and des2 is not None and len(des1) > 0 and len(des2) > 0:
-            matches = self.bf.knnMatch(des1, des2, k=2)
-            good_matches = []
-            # Ratio test
-            for m, n in matches:
-                if m.distance < 0.75 * n.distance:
-                    good_matches.append(m)
-
-            if len(good_matches) >= 4: # Min points for estimateAffinePartial2D
-                src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-
-                M, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=5.0)
-
-                if M is not None and mask is not None:
-                    inlier_count = np.sum(mask)
-
-        # --- Decision: Use Feature Match or Fallback? ---
-        if M is not None and inlier_count >= self.min_match_count:
-            # Use feature-based estimate
-            print(f"    -> Using ORB (Inliers: {inlier_count})")
-            dx, dy = M[0, 2], M[1, 2]
-            # print(f"    -> Using ORB: dx={dx:.1f}, dy={dy:.1f}, inliers={inlier_count}") # Optional debug
-            # RANSAC gives transform from src (prev) to dst (cur).
-            # Need to negate for accumulation loop expectation.
-            return np.array([[1, 0, -dx], [0, 1, -dy]], dtype=np.float64)
-        else:
-            # --- Attempt 2: Fallback to Phase Correlation (9-block weighted) ---
-            print("    -> Using Phase Correlation Fallback")
-            # print("    -> Using Phase Correlation Fallback") # Optional debug
-            prev_gray = prev_gray_orb.astype(np.float32) # Convert uint8 gray to float32
-            cur_gray = cur_gray_orb.astype(np.float32)
-
-            # Define 9 block centers for a 3x3 grid
-            # Block size will be roughly h/3 x w/3
-            # Centers at (w/6, h/6), (w/2, h/6), (5w/6, h/6), ... (w/2, h/2), ... (5w/6, 5h/6)
-            block_h, block_w = h // 6, w // 6 # Use smaller blocks for 3x3 grid
-            half_bh, half_bw = block_h // 2, block_w // 2
-
-            centers = []
-            for row in range(3):
-                cy = (2 * row + 1) * h // 6
-                for col in range(3):
-                    cx = (2 * col + 1) * w // 6
-                    centers.append((cx, cy))
-
-            shifts = []
-            variances = []
-            epsilon = 1e-6 # To avoid division by zero
-
-            for cx, cy in centers:
-                # Define block boundaries
-                y_start, y_end = cy - half_bh, cy + half_bh
-                x_start, x_end = cx - half_bw, cx + half_bw
-
-                # Ensure block is within image bounds (can happen with small images)
-                y_start, y_end = max(0, y_start), min(h, y_end)
-                x_start, x_end = max(0, x_start), min(w, x_end)
-
-                if (y_end - y_start) <= 0 or (x_end - x_start) <= 0:
-                    continue # Skip if block has zero size
-
-                prev_block = prev_gray[y_start:y_end, x_start:x_end]
-                cur_block = cur_gray[y_start:y_end, x_start:x_end]
-
-                # Calculate variance of the previous block
-                variance = np.var(prev_block)
-                variances.append(variance + epsilon)
-
-                # Phase correlation for the block
-                block_h_actual, block_w_actual = prev_block.shape
-                win = cv2.createHanningWindow((block_w_actual, block_h_actual), cv2.CV_32F)
-                prev_block_win = prev_block * win
-                cur_block_win = cur_block * win
-
-                shift, response = cv2.phaseCorrelate(prev_block_win, cur_block_win)
-                shifts.append(shift) # (dx, dy)
-
-            if not shifts or sum(variances) == 0:
-                 # Handle cases with no valid blocks or zero variance (e.g., black frames)
-                final_dx, final_dy = 0.0, 0.0
-            else:
-                # Weighted average
-                total_variance = sum(variances)
-                final_dx = sum(s[0] * v for s, v in zip(shifts, variances)) / total_variance
-                final_dy = sum(s[1] * v for s, v in zip(shifts, variances)) / total_variance
-
-            # Phase correlate gives (dx, dy) shift from prev to cur.
-            # The matrix should reflect this forward motion for accumulation.
-            # However, based on previous runs and the template matching logic,
-            # the accumulation loop seems to expect the *negated* shift.
-            return np.array([[1, 0, -final_dx], [0, 1, -final_dy]], dtype=np.float64)
-
 
     def feature_detection_and_matching(self, frame1, frame2, frame_idx1, frame_idx2, video_file):
         # Convert frames to grayscale
@@ -206,7 +102,7 @@ class MotionEstimator:
         method=cv2.RANSAC,
         ransacReprojThreshold=4.0,
         maxIters=5000,
-        confidence=0.995)
+                                         confidence=0.995)
 
         if H_affine is None:
             print(f"Affine estimation failed between frames {frame_idx1}->{frame_idx2}")
@@ -218,13 +114,13 @@ class MotionEstimator:
 
         # Optional: Check the number of inliers
         if mask is not None:
-             num_inliers = np.sum(mask)
-             if num_inliers < 4:
-                 print(f"Homography found, but too few inliers ({num_inliers}) between frame {frame_idx1} and {frame_idx2}.")
-                 return None # Treat as failure
+            num_inliers = np.sum(mask)
+            if num_inliers < 4:
+                print(f"Homography found, but too few inliers ({num_inliers}) between frame {frame_idx1} and {frame_idx2}.")
+                return None # Treat as failure
         else: # Should not happen if H_rel is not None, but check anyway
-             print(f"Homography estimated but RANSAC mask is None between frame {frame_idx1} and {frame_idx2}.")
-             return None
+            print(f"Homography estimated but RANSAC mask is None between frame {frame_idx1} and {frame_idx2}.")
+            return None
 
         return H_rel # Return the 3x3 homography matrix
 
@@ -313,25 +209,48 @@ class GrowableCanvas:
         print(f"Canvas bounds: x=[{self.min_x:.2f}, {self.max_x:.2f}], y=[{self.min_y:.2f}, {self.max_y:.2f}]")
 
         for i, (frame, H_cum) in enumerate(self.frames_data): # Use H_cum
-            print(f"Processing frame {i+1}/{len(self.frames_data)} for final warp...")
-
             # Combine H_cum with canvas translation T
             H_final = T @ H_cum # 3x3 multiplication
 
             try:
                 # Use warpPerspective instead of warpAffine
                 warped_frame = cv2.warpPerspective(frame, H_final, (final_w, final_h),
-                                                 flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
+                                                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
 
-                # Update canvas only where it's currently black (empty)
-                # and the warped_frame has non-black content.
-                # This prevents overwriting already filled parts of the canvas
-                # and helps avoid issues where black borders of a new frame
-                # would effectively erase existing content or leave black lines.
-                canvas_is_empty_mask = (np.sum(canvas, axis=2) == 0)
-                warped_frame_has_content_mask = (np.sum(warped_frame, axis=2) > 0)
-                update_mask = canvas_is_empty_mask & warped_frame_has_content_mask
-                canvas[update_mask] = warped_frame[update_mask]
+                # Alpha Blending (Averaging in overlap regions)
+                # Convert canvas and warped_frame to float for blending calculations
+                canvas_float = canvas.astype(np.float32)
+                warped_frame_float = warped_frame.astype(np.float32)
+
+                # Create alpha masks (H,W). A pixel has content if sum of its channels > 0.
+                # Mask for existing content on the canvas (non-black pixels)
+                alpha_canvas = (np.sum(canvas, axis=2) > 0).astype(np.float32)
+                # Mask for new content from the warped frame (non-black pixels)
+                alpha_warped = (np.sum(warped_frame, axis=2) > 0).astype(np.float32)
+
+                # Expand mask dimensions to (H,W,1) for broadcasting with (H,W,3) images
+                alpha_canvas_expanded = alpha_canvas[:, :, np.newaxis]
+                alpha_warped_expanded = alpha_warped[:, :, np.newaxis]
+
+                # Numerator for the blend: (canvas_content * its_weight) + (warped_content * its_weight)
+                # Where a mask is 0, the corresponding term becomes 0.
+                numerator = (canvas_float * alpha_canvas_expanded +
+                             warped_frame_float * alpha_warped_expanded)
+
+                # Denominator for the blend: sum of weights
+                # This will be 0.0 where both are black, 1.0 where one has content, 2.0 where both have content.
+                denominator = alpha_canvas_expanded + alpha_warped_expanded
+
+                # Perform safe division. 
+                # 'out=np.zeros_like(canvas_float)' initializes the output array with zeros.
+                # 'where=denominator!=0' ensures division only happens where denominator is non-zero.
+                # If denominator is 0 (both inputs black), the output pixel remains 0 from initialization.
+                canvas_float = np.divide(numerator, denominator,
+                                         out=np.zeros_like(canvas_float),
+                                         where=denominator != 0)
+
+                # Convert the blended result back to uint8 for the canvas
+                canvas = canvas_float.astype(np.uint8)
 
             except cv2.error as e:
                 print(f"Error warping frame {i} with warpPerspective: {e}")
@@ -343,7 +262,7 @@ class GrowableCanvas:
         return canvas
 
 
-def stitch(videos: List[str], stride: int, estimator_arg: str, out_path: str):
+def stitch(videos: List[str], stride: int, out_path: str):
     frames = []
     for v in videos:
         frames.extend(sample_frames(v, stride))
@@ -371,15 +290,7 @@ def stitch(videos: List[str], stride: int, estimator_arg: str, out_path: str):
         cur_frame = frames[i]
 
         # Estimate relative motion (Homography)
-        H_rel = None
-        if estimator_arg == "feature_detection_and_matching":
-             # Ensure this method returns the relative 3x3 matrix (prev -> cur)
-             H_rel = estimator.feature_detection_and_matching(prev_frame, cur_frame, i-1, i, videos[0])
-        elif estimator_arg == "naive":
-             # estimate() returns M_rel (prev -> cur) directly now
-             H_rel = estimator.naive_estimate(prev_frame, cur_frame)
-        else:
-            raise ValueError(f"Unknown estimator: {estimator_arg}")
+        H_rel = estimator.feature_detection_and_matching(prev_frame, cur_frame, i-1, i, videos[0])
 
         if H_rel is None:
              print(f"Motion estimation failed between frame {i-1} and {i}. Skipping frame {i}.")
@@ -390,14 +301,11 @@ def stitch(videos: List[str], stride: int, estimator_arg: str, out_path: str):
         H_rel_inv = np.linalg.inv(H_rel)
         H_cum = H_rel_inv @ H_cum
         H_cum /= H_cum[2, 2]  # Normalize to keep numerical stability
-
-        print(f"Adding frame {i} to canvas.")
         canvas.add(cur_frame, H_cum) # Add with the new H_cum
 
-        if i % 100 == 0:
+        if i % 20 == 0:
             print(f"Frame {i}: |H_cum| = {np.linalg.det(H_cum):.4f}, bottom row = {H_cum[2]}") 
             cv2.imwrite(str(debug_dir / f"debug_canvas_after_frame_{i:03d}.png"), canvas.get_final_image())
-
 
         # Update for next iteration
         prev_frame = cur_frame
@@ -417,7 +325,6 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='Panorama stitcher – sliver-based')
     ap.add_argument('--videos', nargs='+', required=True)
     ap.add_argument('--stride', type=int, default=1)
-    ap.add_argument('--estimator', type=str, default='feature_detection_and_matching')
     args = ap.parse_args()
     ap.add_argument('--out', default=Path(args.videos[0]).stem + '.png')
     args = ap.parse_args()
@@ -425,4 +332,4 @@ if __name__ == '__main__':
     for p in args.videos:
         if not Path(p).exists():
             ap.error(f"Video not found: {p}")
-    stitch(args.videos, args.stride, args.estimator, args.out)
+    stitch(args.videos, args.stride, args.out)
