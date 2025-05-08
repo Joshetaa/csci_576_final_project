@@ -158,45 +158,6 @@ class MotionEstimator:
             # the accumulation loop seems to expect the *negated* shift.
             return np.array([[1, 0, -final_dx], [0, 1, -final_dy]], dtype=np.float64)
 
-    def create_debug_visualization(self, prev_frame: np.ndarray, cur_frame: np.ndarray, dx: float, dy: float) -> np.ndarray:
-        """Creates a side-by-side visualization of prev/cur frames with motion squares."""
-        # --- Debug: draw comparison squares ---
-        tpl_size = 16 # Keep fixed size for visualization clarity
-        half = tpl_size // 2
-        h_prev, w_prev = prev_frame.shape[:2]
-        cx, cy = w_prev // 2, h_prev // 2
-
-        # Create copy of previous frame and draw white square (template area)
-        vis_prev = prev_frame.copy()
-        prev_tl = (cx - half, cy - half) # Top-left
-        prev_br = (cx + half, cy + half) # Bottom-right
-        cv2.rectangle(vis_prev, prev_tl, prev_br, (255, 255, 255), 2) # White square
-
-        # Create copy of current frame and draw red square (matched area)
-        vis_cur = cur_frame.copy()
-        # top-left corner of matched block in current frame using final dx, dy
-        match_tl_x = int((cx - half) + dx)
-        match_tl_y = int((cy - half) + dy)
-        match_br_x = match_tl_x + tpl_size
-        match_br_y = match_tl_y + tpl_size
-        # Ensure coordinates are within bounds
-        h_cur, w_cur = cur_frame.shape[:2]
-        match_tl_x = max(0, match_tl_x)
-        match_tl_y = max(0, match_tl_y)
-        match_br_x = min(w_cur, match_br_x)
-        match_br_y = min(h_cur, match_br_y)
-        cv2.rectangle(vis_cur, (match_tl_x, match_tl_y), (match_br_x, match_br_y), (0, 0, 255), 2) # Red square
-
-        # Combine images side-by-side
-        if vis_prev.shape[0] != vis_cur.shape[0]:
-            print(f"Warning: Frame heights differ for debug visualization {vis_prev.shape[0]} vs {vis_cur.shape[0]}!")
-            # Return only current frame visualization as fallback
-            return vis_cur
-        else:
-            combined_vis = np.hstack((vis_prev, vis_cur))
-            return combined_vis
-        # -------------------------------------------------------------------
-
 
     def feature_detection_and_matching(self, frame1, frame2, frame_idx1, frame_idx2, video_file):
         # Convert frames to grayscale

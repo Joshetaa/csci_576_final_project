@@ -17,6 +17,7 @@ Dependencies
 """
 
 import argparse
+import random
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -41,6 +42,11 @@ def sample_frames(path: str, stride: int = 1) -> List[np.ndarray]:
     cap.release()
     print(f"{Path(path).name}: kept {len(frames)} frames (stride={stride})")
     return frames
+
+def tiny_hist(gray):
+    small = cv2.resize(gray, (64,64))
+    h = cv2.calcHist([small], [0], None, [32], [0,256])
+    return cv2.normalize(h, h).flatten()
 
 # ---------------------------------------------------------------------------
 # Motion estimation – quadrant-based phase correlation
@@ -81,11 +87,6 @@ class MotionEstimator:
             curr_feats.append((g, kp, des))
 
         # 2) Precompute tiny histograms for pruning
-        def tiny_hist(gray):
-            small = cv2.resize(gray, (64,64))
-            h = cv2.calcHist([small], [0], None, [32], [0,256])
-            return cv2.normalize(h, h).flatten()
-
         prev_hists = [tiny_hist(g) for g,_,_ in prev_feats]
         curr_hists = [tiny_hist(g) for g,_,_ in curr_feats]
 
@@ -240,14 +241,6 @@ class MotionEstimator:
         points1 = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
         points2 = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
 
-        # Find homography using RANSAC
-        # --- old ---
-        # H_rel, mask = cv2.findHomography(points1, points2, cv2.RANSAC, 5.0)
-        # if H_rel is None:
-        #     print(f"Homography estimation failed between frame {frame_idx1} and {frame_idx2}.")
-        #     return None
-
-        # --- new ---
         if hasattr(self, 'use_homography') and self.use_homography:
             # Use full projective homography
             H, mask = cv2.findHomography(
@@ -350,7 +343,7 @@ class GrowableCanvas:
              print("Warning: Attempted to add frame with invalid H_cum. Frame skipped.")
 
 
-    def get_final_image(self, min_new_pixel_percent: float = 0.05) -> np.ndarray:
+    def get_final_image(self, blend: str = "average", min_new_pixel_percent: float = 0.05) -> np.ndarray:
         """Create the final stitched panorama using perspective warping."""
         if not self.frames_data:
             raise ValueError("No frames to stitch!")
@@ -408,29 +401,38 @@ class GrowableCanvas:
                     print(status.ljust(last_status_length), end="\r")
                     last_status_length = len(status)
 
-                # Expand mask dimensions to (H,W,1) for broadcasting with (H,W,3) images
-                alpha_canvas_expanded = alpha_canvas[:, :, np.newaxis]
-                alpha_warped_expanded = alpha_warped[:, :, np.newaxis]
+                if blend == "average":
+                    # Expand mask dimensions to (H,W,1) for broadcasting with (H,W,3) images
+                    alpha_canvas_expanded = alpha_canvas[:, :, np.newaxis]
+                    alpha_warped_expanded = alpha_warped[:, :, np.newaxis]
 
-                # Numerator for the blend: (canvas_content * its_weight) + (warped_content * its_weight)
-                # Where a mask is 0, the corresponding term becomes 0.
-                numerator = (canvas_float * alpha_canvas_expanded +
-                             warped_frame_float * alpha_warped_expanded)
+                    # Numerator for the blend: (canvas_content * its_weight) + (warped_content * its_weight)
+                    # Where a mask is 0, the corresponding term becomes 0.
+                    numerator = (canvas_float * alpha_canvas_expanded +
+                                warped_frame_float * alpha_warped_expanded)
 
-                # Denominator for the blend: sum of weights
-                # This will be 0.0 where both are black, 1.0 where one has content, 2.0 where both have content.
-                denominator = alpha_canvas_expanded + alpha_warped_expanded
+                    # Denominator for the blend: sum of weights
+                    # This will be 0.0 where both are black, 1.0 where one has content, 2.0 where both have content.
+                    denominator = alpha_canvas_expanded + alpha_warped_expanded
 
-                # Perform safe division. 
-                # 'out=np.zeros_like(canvas_float)' initializes the output array with zeros.
-                # 'where=denominator!=0' ensures division only happens where denominator is non-zero.
-                # If denominator is 0 (both inputs black), the output pixel remains 0 from initialization.
-                canvas_float = np.divide(numerator, denominator,
-                                         out=np.zeros_like(canvas_float),
-                                         where=denominator != 0)
+                    # Perform safe division. 
+                    # 'out=np.zeros_like(canvas_float)' initializes the output array with zeros.
+                    # 'where=denominator!=0' ensures division only happens where denominator is non-zero.
+                    # If denominator is 0 (both inputs black), the output pixel remains 0 from initialization.
+                    canvas_float = np.divide(numerator, denominator,
+                                            out=np.zeros_like(canvas_float),
+                                            where=denominator != 0)
 
-                # Convert the blended result back to uint8 for the canvas
-                canvas = canvas_float.astype(np.uint8)
+                    # Convert the blended result back to uint8 for the canvas
+                    canvas = canvas_float.astype(np.uint8)
+                else:
+                    alpha_warped = (np.sum(warped_frame, axis=2) > 0).astype(bool)  # Pixels in warped frame
+                    alpha_canvas = (np.sum(canvas, axis=2) > 0).astype(bool)        # Pixels in canvas
+                    new_content_mask = np.logical_and(alpha_warped, np.logical_not(alpha_canvas))
+
+                    # Apply the mask - only add pixels that are in warped_frame but not already in canvas
+                    # This preserves all existing canvas content and only adds new content
+                    canvas[new_content_mask] = warped_frame[new_content_mask] 
 
             except cv2.error as e:
                 print(f"Error warping frame {i} with warpPerspective: {e}")
@@ -441,10 +443,97 @@ class GrowableCanvas:
 
         return canvas
 
+def detect_loop_closure(estimator, frame, frame_idx, descriptor_database, threshold=0.7):
+    """
+    Check if the current frame matches any previously seen frame.
+    Returns: (matched_idx, H_rel) or (None, None) if no match found
+    """
+    # Skip very recent frames (already matched with consecutive homography)
+    if len(descriptor_database) < 10:
+        return None, None
+        
+    # Extract features for current frame
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    kp, des = estimator.orb.detectAndCompute(gray, None)
+    if des is None:
+        return None, None
+        
+    # Histogram-based pruning (similar to find_best_overlap)
+    current_hist = tiny_hist(gray)  # Implement this helper function
+    
+    best_match_idx = None
+    best_H_rel = None
+    best_inliers = 0
+    
+    # Only check against frames that are not too recent (to avoid near-duplicates)
+    # and prioritize checking frames that are likely to form loops
+    candidates = []
+    for db_idx, (db_frame_idx, db_des, db_kp, _) in enumerate(descriptor_database):
+        # Skip very recent frames (already handled by consecutive matching)
+        if abs(frame_idx - db_frame_idx) < 20:
+            continue
+        
+        # Prioritize frames from much earlier in the sequence (potential loop closures)
+        # or from earlier video segments
+        if frame_idx - db_frame_idx > 50:
+            candidates.append((db_idx, db_des, db_kp))
+    
+    # Limit number of candidates to check (for performance)
+    if len(candidates) > 20:
+        # Randomly sample or use other heuristics to select candidates
+        candidates = random.sample(candidates, 20)
+    
+    for db_idx, db_des, db_kp in candidates:
+        # Match descriptors
+        matches = sorted(estimator.bf.match(des, db_des), key=lambda m: m.distance)
+        if len(matches) < 10:
+            continue
+            
+        # Keep good matches
+        keep = min(len(matches), max(10, int(len(matches)*0.7)))
+        good = matches[:keep]
+        
+        # Get matched points
+        pts1 = np.float32([kp[m.queryIdx].pt for m in good]).reshape(-1,1,2)
+        pts2 = np.float32([db_kp[m.trainIdx].pt for m in good]).reshape(-1,1,2)
+        
+        # Estimate transformation
+        if estimator.use_homography:
+            H_rel, mask = cv2.findHomography(
+                pts1, pts2,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=4.0,
+                maxIters=2000,
+                confidence=0.99
+            )
+        else:
+            H_rel, mask = cv2.estimateAffinePartial2D(
+                pts1, pts2,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=4.0,
+                maxIters=2000,
+                confidence=0.99
+            )
+            
+        if H_rel is None or mask is None:
+            continue
+            
+        inliers = int(mask.sum())
+        inlier_ratio = inliers / len(good)
+        
+        # Check if this is a strong match
+        if inliers > best_inliers and inliers > 15 and inlier_ratio > 0.6:
+            best_inliers = inliers
+            best_match_idx = db_idx
+            if not estimator.use_homography:
+                # Convert affine to homography
+                H_rel = np.vstack([H_rel, [0,0,1]]).astype(np.float64)
+            best_H_rel = H_rel
+    
+    return best_match_idx, best_H_rel
 
 
-
-def stitch(videos: List[str], stride: int, out_path: str, order: List[int], frames_per_debug: int = 20, min_new_pixel_percent: float = 0.05, use_homography: bool = False):
+def stitch(videos: List[str], stride: int, out_path: str, order: List[int], frames_per_debug: int = 20, min_new_pixel_percent: float = 0.05, use_homography: bool = False, blend: str = "average"):
 
     # 1) Load each video into its own frame list
     sequences = [ sample_frames(v, stride) for v in videos ]
@@ -468,6 +557,8 @@ def stitch(videos: List[str], stride: int, out_path: str, order: List[int], fram
     # --- Maintain per-frame cumulative homographies for each segment ---
     # Assume: homographies[segment_idx][frame_idx] = cumulative H to origin
     homographies = []
+    descriptor_database = []
+
     # For the first segment:
     first_frames = sequences[order[0]]
     H_cum = np.eye(3)
@@ -481,9 +572,28 @@ def stitch(videos: List[str], stride: int, out_path: str, order: List[int], fram
             H_cum /= H_cum[2, 2]  # Normalize to keep numerical stability
             canvas.add(frame, H_cum)
             homographies_segment.append(H_cum.copy())
-        if len(canvas.frames_data) % frames_per_debug == 0:
-                print(f"Debug: Frame {len(canvas.frames_data)} |H_cum| = {np.linalg.det(H_cum):.4f}, bottom row = {H_cum[2]}")
-                cv2.imwrite(str(debug_dir / f"debug_canvas_{len(canvas.frames_data):03d}.png"), canvas.get_final_image(min_new_pixel_percent))
+        # if len(canvas.frames_data) % frames_per_debug == 0:
+        #         print(f"Debug: Frame {len(canvas.frames_data)} |H_cum| = {np.linalg.det(H_cum):.4f}, bottom row = {H_cum[2]}")
+        #         cv2.imwrite(str(debug_dir / f"debug_canvas_{len(canvas.frames_data):03d}.png"), canvas.get_final_image(blend, min_new_pixel_percent))
+        # Check for loop closure
+        frame_count = len(canvas.frames_data)
+        matched_idx, loop_H_rel = detect_loop_closure(
+            estimator, frame, frame_count, descriptor_database)
+        
+        if matched_idx is not None:
+            # Loop closure detected
+            print(f"Loop closure detected: current frame {frame_count} matches with frame {descriptor_database[matched_idx][0]}")
+            matched_frame_idx, _, _, matched_H_cum = descriptor_database[matched_idx]
+            H_cum_new = matched_H_cum @ loop_H_rel
+            H_cum = H_cum_new
+            H_cum /= H_cum[2, 2]  # Normalize
+            
+        # Store descriptors in the database
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        kp, des = estimator.orb.detectAndCompute(gray, None)
+        if des is not None:
+            descriptor_database.append((frame_count, des, kp, H_cum.copy()))
+            
         prev_frame = frame
     homographies.append(homographies_segment)
 
@@ -528,12 +638,34 @@ def stitch(videos: List[str], stride: int, out_path: str, order: List[int], fram
                     H_cum /= H_cum[2, 2]
                 canvas.add(frame, H_cum)
                 homographies_segment[i] = H_cum.copy()
+                
+                # Check for loop closure
+                frame_count = len(canvas.frames_data)
+                matched_idx, loop_H_rel = detect_loop_closure(
+                    estimator, frame, frame_count, descriptor_database)
+                
+                if matched_idx is not None:
+                    # Loop closure detected
+                    print(f"Loop closure detected: current frame {frame_count} matches with frame {descriptor_database[matched_idx][0]}")
+                    matched_frame_idx, _, _, matched_H_cum = descriptor_database[matched_idx]
+                    H_cum_new = matched_H_cum @ loop_H_rel
+                    H_cum = H_cum_new
+                    H_cum /= H_cum[2, 2]  # Normalize
+                    # Update the homography in the segment data as well
+                    homographies_segment[i] = H_cum.copy()
+                    
+                # Store descriptors in the database
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                kp, des = estimator.orb.detectAndCompute(gray, None)
+                if des is not None:
+                    descriptor_database.append((frame_count, des, kp, H_cum.copy()))
+                    
                 prev_frame = frame
             
             # Debug output
             if len(canvas.frames_data) % frames_per_debug == 0:
                 print(f"Debug: Frame {len(canvas.frames_data)} |H_cum| = {np.linalg.det(H_cum):.4f}, bottom row = {H_cum[2]}")
-                cv2.imwrite(str(debug_dir / f"debug_canvas_{len(canvas.frames_data):03d}.png"), canvas.get_final_image(min_new_pixel_percent))
+                cv2.imwrite(str(debug_dir / f"debug_canvas_{len(canvas.frames_data):03d}.png"), canvas.get_final_image(blend, min_new_pixel_percent))
 
         # Stitch backward from pivot
         H_cum_back = H_cum.copy()
@@ -546,12 +678,34 @@ def stitch(videos: List[str], stride: int, out_path: str, order: List[int], fram
                 H_cum_back /= H_cum_back[2, 2]
             canvas.add(frame, H_cum_back)
             homographies_segment[i] = H_cum_back.copy()
+            
+            # Check for loop closure
+            frame_count = len(canvas.frames_data)
+            matched_idx, loop_H_rel = detect_loop_closure(
+                estimator, frame, frame_count, descriptor_database)
+            
+            if matched_idx is not None:
+                # Loop closure detected
+                print(f"Loop closure detected: current frame {frame_count} matches with frame {descriptor_database[matched_idx][0]}")
+                matched_frame_idx, _, _, matched_H_cum = descriptor_database[matched_idx]
+                H_cum_back_new = matched_H_cum @ loop_H_rel
+                H_cum_back = H_cum_back_new
+                H_cum_back /= H_cum_back[2, 2]  # Normalize
+                # Update the homography in the segment data as well
+                homographies_segment[i] = H_cum_back.copy()
+                
+            # Store descriptors in the database
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            kp, des = estimator.orb.detectAndCompute(gray, None)
+            if des is not None:
+                descriptor_database.append((frame_count, des, kp, H_cum_back.copy()))
+                
             prev_frame = frame
 
             # Debug output
             if len(canvas.frames_data) % frames_per_debug == 0:
                 print(f"Debug: Frame {len(canvas.frames_data)} |H_cum| = {np.linalg.det(H_cum):.4f}, bottom row = {H_cum[2]}")
-                cv2.imwrite(str(debug_dir / f"debug_canvas_{len(canvas.frames_data):03d}.png"), canvas.get_final_image(min_new_pixel_percent))
+                cv2.imwrite(str(debug_dir / f"debug_canvas_{len(canvas.frames_data):03d}.png"), canvas.get_final_image(blend, min_new_pixel_percent))
 
         homographies.append(homographies_segment)
         
@@ -575,6 +729,7 @@ if __name__ == '__main__':
     ap.add_argument('--frames_per_debug', type=int, default=20)
     ap.add_argument('--homography', action='store_true', help='Use full projective homography instead of affine transform')
     ap.add_argument('--min_new_pixel_percent', type=float, default=0.05, help='Minimum percent of new pixels required to add a frame to the canvas (0.0-1.0)')
+    ap.add_argument('--blend', type=str, default="average", choices=["average", "new"], help='Blending method for overlapping regions')
     args = ap.parse_args()
 
     # Support: if --videos is a single directory, expand to all .mp4 files in that directory
@@ -594,4 +749,4 @@ if __name__ == '__main__':
     if args.order is None:
         args.order = list(range(len(args.videos)))
     print("Creating output file: ", args.out)
-    stitch(args.videos, args.stride, args.out, args.order, args.frames_per_debug, args.min_new_pixel_percent, args.homography)
+    stitch(args.videos, args.stride, args.out, args.order, args.frames_per_debug, args.min_new_pixel_percent, args.homography, args.blend)

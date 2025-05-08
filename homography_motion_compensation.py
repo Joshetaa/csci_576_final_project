@@ -217,40 +217,50 @@ class GrowableCanvas:
                 warped_frame = cv2.warpPerspective(frame, H_final, (final_w, final_h),
                                                 flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
 
-                # Alpha Blending (Averaging in overlap regions)
-                # Convert canvas and warped_frame to float for blending calculations
-                canvas_float = canvas.astype(np.float32)
-                warped_frame_float = warped_frame.astype(np.float32)
 
-                # Create alpha masks (H,W). A pixel has content if sum of its channels > 0.
-                # Mask for existing content on the canvas (non-black pixels)
-                alpha_canvas = (np.sum(canvas, axis=2) > 0).astype(np.float32)
-                # Mask for new content from the warped frame (non-black pixels)
-                alpha_warped = (np.sum(warped_frame, axis=2) > 0).astype(np.float32)
+                alpha_warped = (np.sum(warped_frame, axis=2) > 0).astype(bool)  # Pixels in warped frame
+                alpha_canvas = (np.sum(canvas, axis=2) > 0).astype(bool)        # Pixels in canvas
+                new_content_mask = np.logical_and(alpha_warped, np.logical_not(alpha_canvas))
 
-                # Expand mask dimensions to (H,W,1) for broadcasting with (H,W,3) images
-                alpha_canvas_expanded = alpha_canvas[:, :, np.newaxis]
-                alpha_warped_expanded = alpha_warped[:, :, np.newaxis]
+                # Apply the mask - only add pixels that are in warped_frame but not already in canvas
+                # This preserves all existing canvas content and only adds new content
+                canvas[new_content_mask] = warped_frame[new_content_mask]   
+                
+                # alternative alpha blending
+                # # Alpha Blending (Averaging in overlap regions)
+                # # Convert canvas and warped_frame to float for blending calculations
+                # canvas_float = canvas.astype(np.float32)
+                # warped_frame_float = warped_frame.astype(np.float32)
 
-                # Numerator for the blend: (canvas_content * its_weight) + (warped_content * its_weight)
-                # Where a mask is 0, the corresponding term becomes 0.
-                numerator = (canvas_float * alpha_canvas_expanded +
-                             warped_frame_float * alpha_warped_expanded)
+                # # Create alpha masks (H,W). A pixel has content if sum of its channels > 0.
+                # # Mask for existing content on the canvas (non-black pixels)
+                # alpha_canvas = (np.sum(canvas, axis=2) > 0).astype(np.float32)
+                # # Mask for new content from the warped frame (non-black pixels)
+                # alpha_warped = (np.sum(warped_frame, axis=2) > 0).astype(np.float32)
 
-                # Denominator for the blend: sum of weights
-                # This will be 0.0 where both are black, 1.0 where one has content, 2.0 where both have content.
-                denominator = alpha_canvas_expanded + alpha_warped_expanded
+                # # Expand mask dimensions to (H,W,1) for broadcasting with (H,W,3) images
+                # alpha_canvas_expanded = alpha_canvas[:, :, np.newaxis]
+                # alpha_warped_expanded = alpha_warped[:, :, np.newaxis]
 
-                # Perform safe division. 
-                # 'out=np.zeros_like(canvas_float)' initializes the output array with zeros.
-                # 'where=denominator!=0' ensures division only happens where denominator is non-zero.
-                # If denominator is 0 (both inputs black), the output pixel remains 0 from initialization.
-                canvas_float = np.divide(numerator, denominator,
-                                         out=np.zeros_like(canvas_float),
-                                         where=denominator != 0)
+                # # Numerator for the blend: (canvas_content * its_weight) + (warped_content * its_weight)
+                # # Where a mask is 0, the corresponding term becomes 0.
+                # numerator = (canvas_float * alpha_canvas_expanded +
+                #              warped_frame_float * alpha_warped_expanded)
 
-                # Convert the blended result back to uint8 for the canvas
-                canvas = canvas_float.astype(np.uint8)
+                # # Denominator for the blend: sum of weights
+                # # This will be 0.0 where both are black, 1.0 where one has content, 2.0 where both have content.
+                # denominator = alpha_canvas_expanded + alpha_warped_expanded
+
+                # # Perform safe division. 
+                # # 'out=np.zeros_like(canvas_float)' initializes the output array with zeros.
+                # # 'where=denominator!=0' ensures division only happens where denominator is non-zero.
+                # # If denominator is 0 (both inputs black), the output pixel remains 0 from initialization.
+                # canvas_float = np.divide(numerator, denominator,
+                #                          out=np.zeros_like(canvas_float),
+                #                          where=denominator != 0)
+
+                # # Convert the blended result back to uint8 for the canvas
+                # canvas = canvas_float.astype(np.uint8)
 
             except cv2.error as e:
                 print(f"Error warping frame {i} with warpPerspective: {e}")
